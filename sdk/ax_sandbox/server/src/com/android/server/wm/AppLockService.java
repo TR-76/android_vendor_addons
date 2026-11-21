@@ -111,7 +111,7 @@ public class AppLockService {
     public void setKeyguardDone(boolean done) {
         mKeyguardDone = done;
         if (!done && mRepository.getLockBehavior() == LOCK_BEHAVIOR_ON_SCREEN_OFF) {
-            clearUnlockedApp();
+            lockAllSessionsAndNotify();
         }
     }
 
@@ -448,6 +448,7 @@ public class AppLockService {
             }
         }
         if (newKey != null) {
+            expireIfTimedOut(newKey);
             cancelTimeoutLock(newKey);
             if (mUnlockedApps.contains(newKey)) {
                 mUnlockTimestamps.put(newKey, SystemClock.elapsedRealtime());
@@ -507,7 +508,17 @@ public class AppLockService {
     }
 
     public void clearUnlockedApp() {
-        lockAllSessionsExcept(Collections.emptySet());
+        switch (mRepository.getLockBehavior()) {
+            case LOCK_BEHAVIOR_ON_LEAVE:
+                lockAllSessionsAndNotify();
+                break;
+            case LOCK_BEHAVIOR_TIMEOUT:
+                scheduleTimeoutsExcept(Collections.emptySet());
+                break;
+            default:
+                // ON_SCREEN_OFF / ON_KILL sessions are relocked by their own triggers.
+                break;
+        }
     }
 
     public void clearUnlockedApp(ActivityRecord r) {
@@ -519,6 +530,11 @@ public class AppLockService {
 
         final Set<String> keep = new HashSet<>(2);
         final String key = sessionKey(r);
+        expireIfTimedOut(key);
+        final Task ownerTask = r.getTask();
+        if (ownerTask != null && !TextUtils.isEmpty(ownerTask.getBasePackageName())) {
+            expireIfTimedOut(sessionKey(ownerTask.mUserId, ownerTask.getBasePackageName()));
+        }
         if (mUnlockedApps.contains(key)) {
             keep.add(key);
         }
@@ -526,7 +542,21 @@ public class AppLockService {
         if (ownerKey != null) {
             keep.add(ownerKey);
         }
-        lockAllSessionsExcept(keep);
+        switch (mRepository.getLockBehavior()) {
+            case LOCK_BEHAVIOR_ON_LEAVE:
+                lockAllSessionsExcept(keep);
+                break;
+            case LOCK_BEHAVIOR_TIMEOUT:
+                // Leaving an app must start its grace period, not relock it.
+                scheduleTimeoutsExcept(keep);
+                break;
+            default:
+                // ON_SCREEN_OFF / ON_KILL: leaving an app never relocks it.
+                for (String k : keep) {
+                    cancelTimeoutLock(k);
+                }
+                break;
+        }
 
         final long now = SystemClock.elapsedRealtime();
         for (String k : keep) {
@@ -731,11 +761,28 @@ public class AppLockService {
         }
     }
 
+    /**
+     * Starts the grace period for every unlocked session not in {@code keep} that is not
+     * already counting down. Sessions already counting down keep their original deadline.
+     */
+    private void scheduleTimeoutsExcept(Set<String> keep) {
+        for (String key : mUnlockedApps.toArray(new String[0])) {
+            if (keep.contains(key)) {
+                cancelTimeoutLock(key);
+            } else if (!mTimeoutRunnables.containsKey(key)) {
+                scheduleTimeoutLock(key);
+            }
+        }
+    }
+
     private void scheduleTimeoutLock(String key) {
-        if (mRepository.getLockBehavior() != LOCK_BEHAVIOR_TIMEOUT || !mUnlockedApps.contains(key)) {
+        if (key == null || mRepository.getLockBehavior() != LOCK_BEHAVIOR_TIMEOUT
+                || !mUnlockedApps.contains(key)) {
             return;
         }
         cancelTimeoutLock(key);
+        // The timeout counts from when the user left the app, not from when it was opened.
+        mUnlockTimestamps.put(key, SystemClock.elapsedRealtime());
         Runnable r = () -> {
             synchronized (mAtms.mGlobalLock) {
                 ActivityRecord top = mAtms.mRootWindowContainer.getTopResumedActivity();
@@ -748,6 +795,20 @@ public class AppLockService {
         };
         mTimeoutRunnables.put(key, r);
         mAtms.mH.postDelayed(r, mRepository.getLockTimeout() * 1000L);
+    }
+
+    private boolean expireIfTimedOut(String key) {
+        if (key == null || mRepository.getLockBehavior() != LOCK_BEHAVIOR_TIMEOUT
+                || !mTimeoutRunnables.containsKey(key) || !mUnlockedApps.contains(key)) {
+            return false;
+        }
+        Long leftAt = mUnlockTimestamps.get(key);
+        if (leftAt == null
+                || SystemClock.elapsedRealtime() - leftAt <= mRepository.getLockTimeout() * 1000L) {
+            return false;
+        }
+        lockSessionKey(key);
+        return true;
     }
 
     private void cancelTimeoutLock(String key) {
